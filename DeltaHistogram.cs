@@ -1,7 +1,7 @@
 // DeltaHistogram — NT8 独立副图 Delta 直方图指标
 // 每根主图K线内 Delta = 主动买量 - 主动卖量（1-tick序列按 tick rule 判定方向：本tick价>上tick价=主动买，<=主动卖，相等沿用上次方向）。
 // 周期自适应：主图任意秒级/分钟周期都自动按当前K线累计。
-// 显示：正delta=红柱，负delta=绿柱（配色约定：多头=红，空头=绿），柱高=delta大小，不显示数字，无0轴线。
+// 显示：所有柱子从0向上画，柱高=|delta|大小，用颜色区分多空：正delta=红柱，负delta=绿柱（配色约定：多头=红，空头=绿），不显示数字。
 // 均线：|delta| 的 EMA（默认21周期）——衡量近期多空博弈的平均力度。
 #region Using declarations
 using System;
@@ -76,11 +76,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			// 取本K线累计值并清零（下一根重新累计→任意主图周期自适应）
 			double delta = deltaAccum;
 			deltaAccum = 0;
-			Values[0][0] = delta;
+			double absDelta = Math.Abs(delta);
+			Values[0][0] = absDelta;										// 全部向上显示，柱高=|delta|
 			PlotBrushes[0][0] = delta >= 0 ? Brushes.Red : Brushes.Green;	// 配色约定：多头=红，空头=绿
 
 			// |delta| 的 EMA（最近N个周期delta绝对值的均线）
-			double absDelta = Math.Abs(delta);
 			if (!absEmaInit) { absEma = absDelta; absEmaInit = true; }
 			else absEma += 2.0 / (DeltaEmaPeriod + 1) * (absDelta - absEma);
 			Values[1][0] = absEma;
