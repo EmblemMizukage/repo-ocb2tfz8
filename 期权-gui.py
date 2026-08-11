@@ -1093,7 +1093,8 @@ class ProductSidebar(QtWidgets.QWidget):
             return "--"
 
     def update_product_stats(self, code, price=0.0, call_count=0, put_count=0, vix=None,
-                             exchange="SHFE", opt_volume=0.0, expire_date="", underlying=""):
+                             exchange="SHFE", opt_volume=0.0, expire_date="", underlying="",
+                             vwar=None, src=""):
         # ── 标的价 ──
         lp=self._mval_price.get(code)
         if lp:
@@ -1118,11 +1119,16 @@ class ProductSidebar(QtWidgets.QWidget):
         lbl_days=self._lbl_days.get(code)
         if lbl_days:
             lbl_days.setText(self._calc_days_text(expire_date))
-        # ── 底行交易所（中文）+ 合约 ──
+        # ── 底行交易所（中文）+ 合约 + 日均波幅(VWAR9) + 入选来源 ──
         lf=self._lbl_footer.get(code)
         if lf and underlying:
             exch_cn=self._EXCHANGE_CN.get(exchange, exchange)
-            lf.setText(f"{exch_cn}  ·  近月合约 {underlying}")
+            txt=f"{exch_cn}  ·  近月合约 {underlying}"
+            if vwar is not None:
+                txt+=f"  ·  日波 {vwar:.2f}%"
+            if src and src!="VIX":
+                txt+=f"  ·  {src}"
+            lf.setText(txt)
 
     def update_qianlong(self, code, bias="", color=""):
         """更新某品种钱龙红绿柱标签：红柱→偏多(红底)，绿柱→偏空(绿底)。
@@ -1412,6 +1418,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 d.get("opt_volume",0),
                 d.get("expire_date",""),
                 d.get("underlying",""),
+                d.get("vwar"),
+                d.get("src",""),
             )
         vix_map={code: d.get("vix") for code, d in (stats_map or {}).items()}
         self.sidebar.reorder_by_vix(vix_map)
@@ -3589,7 +3597,7 @@ class SignalWindow(QtWidgets.QWidget):
 _hub_lock=threading.Lock();_hub=None;_gui_thread=None
 _gui_status_msg=""
 _data_lock=threading.Lock()
-_shm={"vix30_fe":{},"vix30_tc":{},"vix30_sidebar":{},"vix30_current":"","tc":{},"pc":{},"fe":{},"ci":{},"info":{},"sidebar_stats":{},"iv_map":{},"iv_open_map":{},"iv_sources":{},"status_msg":"","basket":[],"pnl_history":[],"signals":[],"signal_scan_dbg":{},"snapshot":{},"_snapshot_sig":None,"position_syms":[],"qianlong":{}}
+_shm={"vix30_fe":{},"vix30_tc":{},"vix30_sidebar":{},"vix30_current":"","tc":{},"pc":{},"fe":{},"ci":{},"info":{},"sidebar_stats":{},"iv_map":{},"iv_open_map":{},"iv_sources":{},"status_msg":"","basket":[],"pnl_history":[],"signals":[],"signal_scan_dbg":{},"snapshot":{},"_snapshot_sig":None,"position_syms":[],"qianlong":{},"vwar":{}}
 _basket_lock=threading.Lock()   # 保护跨线程 basket 读写
 _basket_pending=[]              # GUI线程 → 策略线程的篮子快照（整体替换）
 _pending_product=""  # 跨线程品种切换信号
@@ -3814,11 +3822,15 @@ class Hub(QtCore.QObject):
             # 侧栏：更新前5品种的统计卡片
             if vix30_sidebar:
                 self.window.update_sidebar_bulk_stats(vix30_sidebar)
-                # 钱龙红绿柱：仅当前 vix30 品种显示，其余隐藏
+                # 钱龙红绿柱：仅当前 vix30 品种显示，其余隐藏；当日转换品种附带转换方向与时间
                 for _qc in vix30_sidebar.keys():
                     _qd = qianlong.get(_qc) or {}
+                    _bias = _qd.get("bias", "")
+                    _flip = _qd.get("flip", "")
+                    if _bias and _flip:
+                        _bias = f"{_bias} · {_flip}"
                     self.window.sidebar.update_qianlong(
-                        _qc, _qd.get("bias", ""), _qd.get("color", ""))
+                        _qc, _bias, _qd.get("color", ""))
                 _order_key = tuple(sorted(vix30_sidebar.keys()))
                 if getattr(self, "_sidebar_order_key", None) != _order_key:
                     self._sidebar_order_key = _order_key
@@ -4471,6 +4483,55 @@ def _qianlong_bias(highs, lows, closes, volumes):
     if cur >= 0:
         return ("偏多", "red", cur)
     return ("偏空", "green", cur)
+
+def _calc_vwar(highs, lows, closes, volumes, n=9):
+    """成交量加权日均波幅（纯函数，便于单测）。
+
+    入参为日K线 OHLCV 序列（均为**已收盘**日线，时间升序），取最近 n 根：
+      TR%ᵢ  = max(高-低, |高-昨收|, |低-昨收|) / 昨收 × 100（真实波幅，含跳空）
+      VWAR = Σ(TR%ᵢ×VOLᵢ) / Σ(VOLᵢ)   成交量加权：放量日权重大
+      AR   = mean(TR%ᵢ)                简单均值（对照）
+    返回 (vwar, ar)；数据不足(<2根)返回 (None, None)。
+    """
+    def _f(x):
+        try:
+            v = float(x)
+            return None if v != v else v
+        except Exception:
+            return None
+    m = len(closes)
+    if m < 2:
+        return (None, None)
+    trs = []
+    lo_i = max(1, m - n)
+    for i in range(lo_i, m):
+        pc = _f(closes[i-1]); hi = _f(highs[i]); lo = _f(lows[i]); vol = _f(volumes[i]) or 0.0
+        if not pc or pc <= 0 or hi is None or lo is None:
+            continue
+        tr = max(hi - lo, abs(hi - pc), abs(lo - pc))
+        trs.append((tr / pc * 100.0, vol))
+    if not trs:
+        return (None, None)
+    ar = sum(t for t, _ in trs) / len(trs)
+    vol_sum = sum(v for _, v in trs)
+    vwar = (sum(t * v for t, v in trs) / vol_sum) if vol_sum > 0 else ar
+    return (vwar, ar)
+
+def _screen_session_id(now=None):
+    """当前筛选交易段标识；非交易段返回 None。
+    日盘 09:00-15:00 -> YYYY-MM-DD-day；夜盘 21:00-23:59 / 00:00-02:30 -> 归属开盘日 -night。
+    用于日盘收盘/夜盘开盘边界的“重新筛选”触发。"""
+    now = now or datetime.datetime.now()
+    if now.weekday() >= 5:
+        return None
+    t = now.strftime("%H:%M")
+    if "09:00" <= t < "15:00":
+        return now.strftime("%Y-%m-%d") + "-day"
+    if "21:00" <= t <= "23:59":
+        return now.strftime("%Y-%m-%d") + "-night"
+    if "00:00" <= t <= "02:30":
+        return (now - datetime.timedelta(hours=4)).strftime("%Y-%m-%d") + "-night"
+    return None
 
 def _scan_ratio_spread(fe, up, tick_map, iv_map, product_code, pinfo, vrank, pvix):
     """扫描比例价差信号。返回 (SignalRecord 列表, 诊断统计 dict)。
@@ -5583,7 +5644,8 @@ def _tqsdk_main_loop(api):
         _log(f"[手动订阅] 从DB恢复当日手动订阅品种: {sorted(forced_products)}")
 
     def _forced_now():
-        """当前强制订阅品种 = 手动订阅(当日) ∪ 有未平模拟持仓的品种（由持仓合约反推）。
+        """当前强制订阅品种 = 手动订阅(当日) ∪ 有未平模拟持仓的品种（由持仓合约反推）
+        ∪ 龙指标当日红↔绿转换品种（本筛选段有效，边界清空）。
         持仓部分使 '有持仓的品种重启/次日自动订阅期权链' 自然成立。"""
         pcodes = set()
         try:
@@ -5595,7 +5657,7 @@ def _tqsdk_main_loop(api):
                     pcodes.add(_c)
         except Exception:
             pass
-        return (forced_products | pcodes) & valid_codes
+        return (forced_products | pcodes | ql_flip_products) & valid_codes
 
     def _push_topn_gui():
         """把当前 vix30_top_codes 推送到 GUI 侧栏（含强制订阅品种）。"""
@@ -5613,17 +5675,39 @@ def _tqsdk_main_loop(api):
             except Exception:
                 pass
 
-    # ---- 钱龙 LON 红绿柱（15min K线，仅对 vix30 品种）----
-    # 订阅各品种标的的 15min K线，**仅在该 15min K线走完后**才更新红绿柱方向。
-    # 天勤 K线按交易所交易时段分桶（非代码启动时间）；最后一根为正在走的未收盘 bar，
-    # 永远排除在计算之外 → 满足"开盘5min时显示昨天最后一根已收盘15min的钱龙"。
+    # ---- 钱龙 LON 红绿柱（15min K线，**全品种**）----
+    # 订阅每个品种标的的 15min K线（一次性常驻，分批建立避免启动瞬间高峰），
+    # **仅在该 15min K线走完后**才更新红绿柱方向（ql_last_dt 去重，其余用缓存）。
+    # 天勤 K线由服务器连带历史推送（400根≥15个交易日），LONG 从序列首根累加，
+    # 任何时刻启动红绿柱都与昨日行情连续一致。最后一根为未收盘 bar，永远排除。
     QL_DURATION   = 15 * 60   # 15min K线
     QL_KLEN       = 400       # 历史根数（LONG 累加 + SMA10/20 暖机收敛）
     QL_INTERVAL   = 3.0       # 检查周期（秒）；仅在已收盘 bar 变化时才真正重算
+    QL_SUB_BATCH  = 10        # 每轮检查新建的K线订阅数上限（全品种几十秒内建完）
     ql_kline_map  = {}        # code -> 标的 15min KlineSerial（订阅一次，随 wait_update 刷新）
     ql_last_dt    = {}        # code -> 最近已纳入计算的"已收盘 bar"的 datetime(ns)
     ql_result     = {}        # code -> {"bias","color","lon","dt"}（仅 bar 走完才更新）
+    ql_sub_fail   = {}        # code -> 订阅失败次数（避免反复重试无期权K线的品种）
     last_ql_check = 0.0
+
+    # ---- 龙指标当日红↔绿转换检测（双向触发，当日有效）----
+    # 新收盘 bar 的 LON 符号与上一根不同 → 记入 ql_flip_products；
+    # 转换品种并入强制订阅集(_forced_now) → 自动订阅期权链 ATM±30、
+    # 加入 GUI 卡片与信号扫描范围；日盘收盘/夜盘开盘边界清空重筛。
+    ql_prev_sign     = {}     # code -> 上一根已收盘bar的LON符号(1/-1)（跨筛选段保留，保证连续性）
+    ql_flip_products = set()  # 当前筛选段内发生过红↔绿转换的品种
+    ql_flip_info     = {}     # code -> {"dir":"绿→红"/"红→绿","time":"HH:MM"}
+
+    # ---- 日均波幅 VWAR9（仅对已订阅期权链的品种）----
+    VWAR_DAYS      = 9        # 最近N个交易日
+    VWAR_KLEN      = VWAR_DAYS + 3
+    vwar_kline_map = {}       # code -> 标的日K线Serial（惰性订阅，常驻）
+    vwar_last_dt   = {}       # code -> 最近已计算的已收盘日线 datetime(ns)
+    vwar_result    = {}       # code -> {"vwar","ar"}
+
+    # ---- 筛选段边界（日盘收盘/夜盘开盘）重新筛选 ----
+    screen_session      = _screen_session_id()  # 当前筛选段（非交易段为 None）
+    last_screen_session = screen_session         # 最近一个非空筛选段；新段开盘时触发重筛
 
     # 持仓合约补订（修复 A 对齐）：窗口外历史持仓也要拿实时行情，否则浮盈亏冻结
     pos_subscribed = {}       # iid -> Quote  已为持仓补订的合约
@@ -5728,7 +5812,8 @@ def _tqsdk_main_loop(api):
                 if _missing_forced:
                     vix30_top_codes.extend(_missing_forced)
                     pos_force_refresh = True
-                    _log(f"[持仓强制] 纳入持仓品种至VIX30窗口(即时算风险): {_missing_forced}  Top={vix30_top_codes}")
+                    _log(f"[持仓强制] 纳入强制品种至VIX30窗口(持仓/手动/龙转换): {_missing_forced}  Top={vix30_top_codes}")
+                    _push_topn_gui()  # 立即推送侧栏卡片（龙转换品种即时可见）
 
         # ---- 心跳日志（每30秒）：确认主循环存活，显示行情状态和订阅数 ----
         # ATM±1 档只在启动时订阅一次（见上方初始化阶段），主循环不再补订
@@ -6128,22 +6213,63 @@ def _tqsdk_main_loop(api):
             except Exception:
                 pass
 
-        # ---- 钱龙 LON 红绿柱：仅对 vix30 品种、仅在 15min K线走完后更新 ----
-        if vix30_initialized and vix30_top_codes and now - last_ql_check >= QL_INTERVAL:
+        # ---- 筛选段边界（日盘收盘/夜盘开盘）：重新筛选 ----
+        # 15:00 日盘收盘、21:00 夜盘开盘时：清空龙转换名单与当日触发保护，
+        # 重算全品种代理VIX并重新锁定 Top-N（高VIX品种与龙转换品种每段重筛）。
+        _sid_now = _screen_session_id()
+        if _sid_now is None and screen_session is not None:
+            # 交易段结束（15:00 日盘收盘 / 02:30 夜盘收盘）：清空龙转换名单，等待下段重筛
+            _log(f"[重筛] 交易段 {screen_session} 结束：清空龙转换名单，待下一段开盘重新筛选")
+            screen_session = None
+            ql_flip_products.clear()
+            ql_flip_info.clear()
+        if _sid_now and _sid_now != last_screen_session:
+            _prev_sid = last_screen_session
+            last_screen_session = _sid_now
+            screen_session = _sid_now
+            if _prev_sid is not None and vix30_initialized:
+                _log(f"[重筛] 筛选段切换 {_prev_sid} → {_sid_now}：清空龙转换名单，重锁VIX Top{VIX30_TOP_N}")
+                ql_flip_products.clear()
+                ql_flip_info.clear()
+                triggered_products.clear()
+                # 用当前行情重算全品种代理VIX（与重排步骤1同口径）
+                for p in product_list:
+                    try:
+                        snap_b = _compute_atm3(p, quote_map, iv_map, api=None, iv_sources_map=iv_sources)
+                    except Exception:
+                        snap_b = None
+                    S_b = snap_b.get("S", 0) if snap_b else 0
+                    vix_b = _calc_proxy_vix(p["full_fe"], S_b, iv_map)
+                    if vix_b is not None:
+                        product_vix_map[p["code"]] = vix_b
+                # 解除锁定 → 下方初排逻辑本轮立即用新VIX重新锁定 Top-N
+                vix30_initialized = False
+                vix30_top_codes = []
+                liq_cooldown.clear()
+
+        # ---- 钱龙 LON 红绿柱：全品种、仅在 15min K线走完后更新 ----
+        if now - last_ql_check >= QL_INTERVAL:
             last_ql_check = now
-            for code in vix30_top_codes:
-                p_ql = product_info.get(code) or {}
-                ul_ql = p_ql.get("underlying", "")
+            sub_budget = QL_SUB_BATCH
+            for p_ql_e in product_list:
+                code = p_ql_e["code"]
+                ul_ql = p_ql_e.get("underlying", "")
                 if not ul_ql:
                     continue
-                # 首次遇到该品种：订阅其标的 15min K线（一次性，随 wait_update 刷新）
+                # 首次遇到该品种：订阅其标的 15min K线（一次性常驻，随 wait_update 刷新）
                 kl = ql_kline_map.get(code)
                 if kl is None:
+                    if sub_budget <= 0 or ql_sub_fail.get(code, 0) >= 3:
+                        continue
+                    sub_budget -= 1
                     try:
                         kl = api.get_kline_serial(ul_ql, QL_DURATION, QL_KLEN)
                         ql_kline_map[code] = kl
+                        if len(ql_kline_map) % 30 == 0 or len(ql_kline_map) == len(product_list):
+                            _log(f"[钱龙] 15min K线订阅进度: {len(ql_kline_map)}/{len(product_list)} 品种")
                     except Exception as e:
-                        _log(f"[钱龙] {code} 订阅15min K线失败: {str(e)[:60]}")
+                        ql_sub_fail[code] = ql_sub_fail.get(code, 0) + 1
+                        _log(f"[钱龙] {code} 订阅15min K线失败({ql_sub_fail[code]}): {str(e)[:60]}")
                     continue  # 本轮数据尚未到位，下轮再算
                 try:
                     dt_arr = list(kl["datetime"]); hi_arr = list(kl["high"])
@@ -6162,7 +6288,7 @@ def _tqsdk_main_loop(api):
                     continue
                 last_done_dt = dt_arr[completed[-1]]
                 if ql_last_dt.get(code) == last_done_dt:
-                    continue  # 该已收盘 bar 未变 → 不更新（必须 15min 走完才更新）
+                    continue  # 该已收盘 bar 未变 → 不更新（必须 15min 走完才更新，缓存生效）
                 hs = [hi_arr[j] for j in completed]; ls = [lo_arr[j] for j in completed]
                 cs = [cl_arr[j] for j in completed]; vs = [vol_arr[j] for j in completed]
                 bias, color, lonv = _qianlong_bias(hs, ls, cs, vs)
@@ -6170,6 +6296,59 @@ def _tqsdk_main_loop(api):
                     ql_last_dt[code] = last_done_dt
                     ql_result[code] = {"bias": bias, "color": color,
                                        "lon": lonv, "dt": int(last_done_dt)}
+                    # ---- 当日红↔绿转换检测（双向）：符号与上一根已收盘bar不同即触发 ----
+                    _sign = 1 if lonv >= 0 else -1
+                    _prev = ql_prev_sign.get(code)
+                    ql_prev_sign[code] = _sign
+                    if _prev is not None and _sign != _prev and screen_session:
+                        _dir = "绿→红" if _sign > 0 else "红→绿"
+                        try:
+                            _bar_t = datetime.datetime.fromtimestamp(last_done_dt / 1e9).strftime("%H:%M")
+                        except Exception:
+                            _bar_t = time.strftime("%H:%M")
+                        if code not in ql_flip_products:
+                            ql_flip_products.add(code)
+                            _log(f"[龙转换] {code} 红绿柱转换 {_dir} @{_bar_t} → 自动订阅期权链并纳入信号扫描")
+                        ql_flip_info[code] = {"dir": _dir, "time": _bar_t}
+
+        # ---- 日均波幅 VWAR9：仅对已订阅期权链的品种（Top-N + 强制/转换）----
+        if vix30_initialized:
+            _vwar_codes = set(vix30_top_codes) | set(vix30_code_window.keys())
+            for code_v in _vwar_codes:
+                p_v = product_info.get(code_v) or {}
+                ul_v = p_v.get("underlying", "")
+                if not ul_v:
+                    continue
+                kd = vwar_kline_map.get(code_v)
+                if kd is None:
+                    try:
+                        vwar_kline_map[code_v] = api.get_kline_serial(ul_v, 86400, VWAR_KLEN)
+                    except Exception as e:
+                        vwar_kline_map[code_v] = False  # 标记失败，不再重试
+                        _log(f"[日波] {code_v} 订阅日K线失败: {str(e)[:60]}")
+                    continue
+                if kd is False:
+                    continue
+                try:
+                    ddt = list(kd["datetime"]); dhi = list(kd["high"])
+                    dlo = list(kd["low"]);      dcl = list(kd["close"])
+                    dvol = list(kd["volume"])
+                except Exception:
+                    continue
+                dvalid = [j for j in range(len(dcl))
+                          if ddt[j] and not (math.isnan(dcl[j]) or math.isnan(dhi[j]) or math.isnan(dlo[j]))]
+                if len(dvalid) < 3:
+                    continue
+                dcompleted = dvalid[:-1]  # 排除正在走的当日未收盘日线
+                d_last = ddt[dcompleted[-1]]
+                if vwar_last_dt.get(code_v) == d_last:
+                    continue
+                vwar_v, ar_v = _calc_vwar(
+                    [dhi[j] for j in dcompleted], [dlo[j] for j in dcompleted],
+                    [dcl[j] for j in dcompleted], [dvol[j] for j in dcompleted], VWAR_DAYS)
+                if vwar_v is not None:
+                    vwar_last_dt[code_v] = d_last
+                    vwar_result[code_v] = {"vwar": vwar_v, "ar": ar_v}
 
         # ---- 定期推送 GUI（只推 VIX 前5品种的 ATM±30 数据）----
         if now - last_gui_push >= GUI_REFRESH_INTERVAL_SEC:
@@ -6230,6 +6409,8 @@ def _tqsdk_main_loop(api):
                     "expire_date": p30.get("expire_date",""),
                     "underlying":  p30["underlying"],
                     "opt_volume":  opt_vol30,
+                    "vwar":       (vwar_result.get(code) or {}).get("vwar"),
+                    "src":        "龙转换" if code in ql_flip_products else "VIX",
                 }
 
             # ---- 信号扫描（扫描全部持有 ATM±30 订阅窗口的品种）----
@@ -6332,8 +6513,18 @@ def _tqsdk_main_loop(api):
                 _shm["vix30_fe"]      = vix30_fe_all
                 _shm["vix30_tc"]      = vix30_tc_new
                 _shm["vix30_sidebar"] = vix30_sidebar_new
-                # 钱龙红绿柱：只暴露当前 vix30 品种（动态跟随重排）
-                _shm["qianlong"] = {c: dict(v) for c, v in ql_result.items() if c in vix30_top_codes}
+                # 钱龙红绿柱：只暴露当前 vix30 品种（动态跟随重排），附带当日转换标记
+                _ql_out = {}
+                for c, v in ql_result.items():
+                    if c not in vix30_top_codes:
+                        continue
+                    _e = dict(v)
+                    _fi = ql_flip_info.get(c)
+                    if _fi:
+                        _e["flip"] = f"转{'红' if _fi['dir'].endswith('红') else '绿'} {_fi['time']}"
+                    _ql_out[c] = _e
+                _shm["qianlong"] = _ql_out
+                _shm["vwar"] = {c: dict(v) for c, v in vwar_result.items() if c in vix30_top_codes}
                 if _shm["vix30_current"] not in vix30_fe_all:
                     _shm["vix30_current"] = current_product
                 # tc：VIX30 窗口合约 + 窗口外持仓补订合约（修复 A：保证持仓浮盈亏不冻结）
